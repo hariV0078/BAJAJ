@@ -3,3 +3,4 @@ uvicorn[standard]
 neo4j
 openai
 pydantic
+gunicorn
