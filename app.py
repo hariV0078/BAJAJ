@@ -88,7 +88,7 @@ def get_gpt_answer(prompt: str) -> str:
         "Content-Type": "application/json"
     }
     body = {
-        "model": "gpt-4o",
+        "model": "gpt-3.5-turbo",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
@@ -137,3 +137,4 @@ async def handle_request(request: EvaluationRequest, authorization: str = Header
             "error": str(e),
             "success": False
         }
+
