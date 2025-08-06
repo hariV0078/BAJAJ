@@ -5,3 +5,4 @@ openai
 pydantic
 gunicorn
 requests
+PyMuPDF>=1.22.0
