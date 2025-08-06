@@ -1,88 +1,110 @@
 import os
 import time
-from fastapi import FastAPI, Request, Header, HTTPException
-from neo4j import GraphDatabase
-import openai
-from pydantic import BaseModel
+import requests
+import fitz  # PyMuPDF
 from typing import List
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+import openai
+from neo4j import GraphDatabase
 
 # --- Configuration ---
 AURA_URI = os.getenv("AURA_URI", "neo4j+s://6f9aa9c3.databases.neo4j.io")
 AURA_USER = os.getenv("AURA_USER", "neo4j")
 AURA_PASSWORD = os.getenv("AURA_PASSWORD", "ZkQ5bYSkAHkajmXH-UnseaZqkKM2HB8c_EKOJEilWHs")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BEARER_TOKEN = os.getenv("BEARER_TOKEN", "mysecrettoken")
+BEARER_TOKEN = os.getenv("BEARER_TOKEN", "e0e272cd2f3ac51a8dda3c63908707c12fc63da7d51f0c7a8fbba91e80db3a88")
 
-# --- Initialize Clients ---
+# --- Initialize FastAPI & Clients ---
 app = FastAPI()
-neo4j_driver = GraphDatabase.driver(AURA_URI, auth=(AURA_USER, AURA_PASSWORD))
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+neo4j_driver = GraphDatabase.driver(AURA_URI, auth=(AURA_USER, AURA_PASSWORD))
 
-# --- Input Data Model ---
+# --- Request Body Model ---
 class EvaluationRequest(BaseModel):
-    documents: List[str]
+    documents: str  # PDF URL
     questions: List[str]
 
-# --- System Prompt for LLM ---
+# --- System Prompt ---
 SYSTEM_PROMPT = """
-You are an AI policy assistant. Your only task is to answer a user's query directly and concisely based strictly on the provided context clauses.
+You are an AI policy assistant. Your task is to extract concise, clear answers from an insurance policy document for the user’s query.
 
-Begin your answer with a clear "Yes" or "No". Then, in the same sentence, briefly state the reason. Do not explain your reasoning process or mention the clause numbers.
+Only answer based on the provided content. Respond in a single sentence, and avoid generic disclaimers. Be accurate and specific.
 
-Please respond in JSON format with the following structure:
-{
-  "answer": "Yes/No, brief reason here"
-}
+Respond with just the final answer as a plain sentence.
 """
 
-# --- /hackrx/run Endpoint ---
+# --- Helper: Extract PDF text from URL ---
+def extract_text_from_pdf_url(url: str) -> str:
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception("Failed to download PDF.")
+    with open("temp_policy.pdf", "wb") as f:
+        f.write(response.content)
+
+    text = ""
+    with fitz.open("temp_policy.pdf") as doc:
+        for page in doc:
+            text += page.get_text()
+    return text
+
+# --- Optional: Log the query into Neo4j (if needed) ---
+def log_query_to_neo4j(question: str, answer: str):
+    with neo4j_driver.session() as session:
+        session.run(
+            "CREATE (q:Question {text: $question, answer: $answer, timestamp: datetime()})",
+            question=question,
+            answer=answer
+        )
+
+# --- Main Evaluation Endpoint ---
 @app.post("/hackrx/run")
-async def process_evaluation(request: EvaluationRequest, authorization: str = Header(None)):
+async def handle_request(request: EvaluationRequest, authorization: str = Header(None)):
     start_time = time.time()
 
-    # 1. Bearer Token Auth
+    # Auth check
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    token = authorization.split(" ")[1]
-    if token != BEARER_TOKEN:
+    if authorization.split(" ")[1] != BEARER_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-    # 2. Combine context
-    context_text = "\n".join(request.documents)
-    results = []
-
-    # 3. Process each question
     try:
-        for question in request.questions:
-            final_prompt = f"""
-            [CONTEXT]
-            {context_text}
+        # 1. Extract context from PDF
+        context = extract_text_from_pdf_url(request.documents)
 
-            [QUERY]
+        # 2. Process questions via LLM
+        answers = []
+        for question in request.questions:
+            prompt = f"""
+            [DOCUMENT]
+            {context}
+
+            [QUESTION]
             {question}
             """
 
-            response = openai_client.chat.completions.create(
-                model="o3",
+            completion = openai_client.chat.completions.create(
+                model="gpt-4o",  # or "o3" if required
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": final_prompt}
-                ],
-                response_format={"type": "json_object"}
+                    {"role": "user", "content": prompt}
+                ]
             )
 
-            json_response = response.choices[0].message.content
-            results.append(json_response)
+            answer = completion.choices[0].message.content.strip()
+            answers.append(answer)
+
+            # Optional: log to Neo4j
+            log_query_to_neo4j(question, answer)
 
         return {
-            "success": True,
-            "processing_time": f"{time.time() - start_time:.2f}s",
-            "answers": results
+            "answers": answers,
+            "processing_time": f"{time.time() - start_time:.2f}s"
         }
 
     except Exception as e:
         return {
-            "success": False,
-            "message": f"Failed to process evaluation: {str(e)}"
+            "answers": [],
+            "error": str(e),
+            "success": False
         }
