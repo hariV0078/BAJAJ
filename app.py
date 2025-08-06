@@ -2,104 +2,114 @@ import os
 import time
 import requests
 import fitz  # PyMuPDF
+import openai
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from typing import List
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-import openai
 from neo4j import GraphDatabase
 
-# --- Configuration ---
+# --- Config ---
 AURA_URI = os.getenv("AURA_URI", "neo4j+s://6f9aa9c3.databases.neo4j.io")
 AURA_USER = os.getenv("AURA_USER", "neo4j")
 AURA_PASSWORD = os.getenv("AURA_PASSWORD", "ZkQ5bYSkAHkajmXH-UnseaZqkKM2HB8c_EKOJEilWHs")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN", "e0e272cd2f3ac51a8dda3c63908707c12fc63da7d51f0c7a8fbba91e80db3a88")
 
-# --- Initialize FastAPI & Clients ---
+# --- Init ---
 app = FastAPI()
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 neo4j_driver = GraphDatabase.driver(AURA_URI, auth=(AURA_USER, AURA_PASSWORD))
 
-# --- Request Body Model ---
 class EvaluationRequest(BaseModel):
-    documents: str  # PDF URL
+    documents: str
     questions: List[str]
 
-# --- System Prompt ---
 SYSTEM_PROMPT = """
-You are an AI policy assistant. Your task is to extract concise, clear answers from an insurance policy document for the user’s query.
+You are an AI assistant for insurance policy documents. For each user query, answer in a single sentence based only on the context provided.
 
-Only answer based on the provided content. Respond in a single sentence, and avoid generic disclaimers. Be accurate and specific.
-
-Respond with just the final answer as a plain sentence.
+Only include the final answer. Do not repeat the question or say “Based on the context”. No JSON. No lists. Just the sentence.
 """
 
-# --- Helper: Extract PDF text from URL ---
-def extract_text_from_pdf_url(url: str) -> str:
+# --- Helpers ---
+def extract_pdf_text(url: str) -> str:
     response = requests.get(url)
     if response.status_code != 200:
         raise Exception("Failed to download PDF.")
     with open("temp_policy.pdf", "wb") as f:
         f.write(response.content)
-
     text = ""
     with fitz.open("temp_policy.pdf") as doc:
         for page in doc:
             text += page.get_text()
     return text
 
-# --- Optional: Log the query into Neo4j (if needed) ---
-def log_query_to_neo4j(question: str, answer: str):
-    with neo4j_driver.session() as session:
-        session.run(
-            "CREATE (q:Question {text: $question, answer: $answer, timestamp: datetime()})",
-            question=question,
-            answer=answer
-        )
+def chunk_text(text, chunk_size=500):
+    words = text.split()
+    return [' '.join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
-# --- Main Evaluation Endpoint ---
+def get_embedding(text):
+    res = openai.Embedding.create(
+        model="text-embedding-ada-002",
+        input=text
+    )
+    return res["data"][0]["embedding"]
+
+def get_top_k_chunks(question, chunks, k=3):
+    q_emb = get_embedding(question)
+    chunk_embs = [get_embedding(chunk) for chunk in chunks]
+    sims = cosine_similarity([q_emb], chunk_embs)[0]
+    top_k = np.argsort(sims)[-k:][::-1]
+    return [chunks[i] for i in top_k]
+
+def log_to_neo4j(question, answer):
+    with neo4j_driver.session() as session:
+        session.run("""
+            CREATE (:QueryLog {
+                question: $q,
+                answer: $a,
+                timestamp: datetime()
+            })
+        """, q=question, a=answer)
+
+# --- Main Endpoint ---
 @app.post("/hackrx/run")
 async def handle_request(request: EvaluationRequest, authorization: str = Header(None)):
-    start_time = time.time()
-
-    # Auth check
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     if authorization.split(" ")[1] != BEARER_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
     try:
-        # 1. Extract context from PDF
-        context = extract_text_from_pdf_url(request.documents)
+        text = extract_pdf_text(request.documents)
+        chunks = chunk_text(text)
+        final_answers = []
 
-        # 2. Process questions via LLM
-        answers = []
         for question in request.questions:
+            top_chunks = get_top_k_chunks(question, chunks)
             prompt = f"""
-            [DOCUMENT]
-            {context}
+[CLAUSES]
+{'\n'.join(top_chunks)}
 
-            [QUESTION]
-            {question}
+[QUESTION]
+{question}
             """
 
-            completion = openai_client.chat.completions.create(
-                model="gpt-4o",  # or "o3" if required
+            completion = openai.ChatCompletion.create(
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
                 ]
             )
 
-            answer = completion.choices[0].message.content.strip()
-            answers.append(answer)
-
-            # Optional: log to Neo4j
-            log_query_to_neo4j(question, answer)
+            answer_text = completion["choices"][0]["message"]["content"].strip()
+            final_answers.append(answer_text)
+            log_to_neo4j(question, answer_text)
 
         return {
-            "answers": answers,
-            "processing_time": f"{time.time() - start_time:.2f}s"
+            "answers": final_answers
         }
 
     except Exception as e:
