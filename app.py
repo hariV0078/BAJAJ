@@ -2,16 +2,13 @@ import os
 import requests
 import fitz  # PyMuPDF
 import json
-import numpy as np
 from typing import List
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from openai import OpenAI
 from neo4j import GraphDatabase
 from functools import lru_cache
-from sklearn.metrics.pairwise import cosine_similarity
 
-# --- Environment ---
+# --- Config ---
 AURA_URI = os.getenv("AURA_URI")
 AURA_USER = os.getenv("AURA_USER")
 AURA_PASSWORD = os.getenv("AURA_PASSWORD")
@@ -20,23 +17,26 @@ BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 
 # --- Init ---
 app = FastAPI()
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 @lru_cache()
 def get_neo4j_driver():
     return GraphDatabase.driver(AURA_URI, auth=(AURA_USER, AURA_PASSWORD))
 
-# --- Request Schema ---
 class EvaluationRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# --- System Prompt ---
 SYSTEM_PROMPT = """
 You are an AI assistant for insurance policies. Answer each question in one complete sentence using only the context provided.
 
 Do not say “Based on the context” or “According to the document”. Do not return JSON or bullet points. Just the answer as a sentence.
 """
+
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
 
 # --- PDF Text Extraction ---
 def extract_pdf_text(url: str) -> str:
@@ -52,27 +52,44 @@ def extract_pdf_text(url: str) -> str:
     return text
 
 # --- Chunking ---
-def chunk_text(text, chunk_size=500):
-    words = text.split()
-    return [' '.join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+def chunk_text(text: str, chunk_size: int = 500) -> List[str]:
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks = []
+    current = ""
+    for para in paragraphs:
+        if len(current) + len(para) < chunk_size:
+            current += " " + para
+        else:
+            chunks.append(current.strip())
+            current = para
+    if current:
+        chunks.append(current.strip())
+    return chunks
 
-# --- Embedding ---
-def get_embedding(text: str) -> List[float]:
-    response = client.embeddings.create(
-        model="text-embedding-ada-002",
-        input=text
-    )
-    return response.data[0].embedding
+# --- Store Chunks in Neo4j ---
+def store_chunks_in_neo4j(chunks: List[str]):
+    with get_neo4j_driver().session() as session:
+        for i, chunk in enumerate(chunks):
+            session.run(
+                "MERGE (c:Clause {id: $id}) SET c.text = $text",
+                id=f"Clause_{i}", text=chunk
+            )
 
-# --- Top-k Chunk Retrieval ---
-def get_top_k_chunks(question: str, chunks: List[str], k=3) -> List[str]:
-    q_emb = get_embedding(question)
-    chunk_embs = [get_embedding(chunk) for chunk in chunks]
-    sims = cosine_similarity([q_emb], chunk_embs)[0]
-    top_k_indices = np.argsort(sims)[-k:][::-1]
-    return [chunks[i] for i in top_k_indices]
+# --- Query relevant clauses ---
+def retrieve_relevant_clauses(question: str, limit=3):
+    with get_neo4j_driver().session() as session:
+        results = session.run(
+            """
+            CALL db.index.fulltext.queryNodes('clauseIndex', $question) YIELD node, score
+            WHERE size(node.text) < 1000
+            RETURN substring(node.text, 0, 500) AS clause
+            ORDER BY score DESC
+            LIMIT $limit
+            """, question=question, limit=limit
+        )
+        return [record["clause"] for record in results]
 
-# --- Logging ---
+# --- Log interaction ---
 def log_to_neo4j(question: str, answer: str):
     with get_neo4j_driver().session() as session:
         session.run(
@@ -80,17 +97,24 @@ def log_to_neo4j(question: str, answer: str):
             q=question, a=answer
         )
 
-# --- GPT Completion ---
+# --- OpenAI Completion ---
 def get_gpt_answer(prompt: str) -> str:
-    chat = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "model": "gpt-4o",
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.2
-    )
-    return chat.choices[0].message.content.strip()
+        "temperature": 0.2
+    }
+    response = requests.post(OPENAI_API_URL, headers=headers, json=body)
+    if response.status_code != 200:
+        raise Exception(f"OpenAI error: {response.text}")
+    return response.json()["choices"][0]["message"]["content"].strip()
 
 # --- Main Endpoint ---
 @app.post("/hackrx/run")
@@ -101,13 +125,19 @@ async def handle_request(request: EvaluationRequest, authorization: str = Header
         raise HTTPException(status_code=403, detail="Invalid token")
 
     try:
-        full_text = extract_pdf_text(request.documents)
-        chunks = chunk_text(full_text)
-        final_answers = []
+        text = extract_pdf_text(request.documents)
+        chunks = chunk_text(text)
 
+        # Store only once
+        with get_neo4j_driver().session() as session:
+            existing = session.run("MATCH (c:Clause) RETURN c.id AS id")
+            if not any(r["id"] == "Clause_0" for r in existing):
+                store_chunks_in_neo4j(chunks)
+
+        final_answers = []
         for question in request.questions:
-            top_chunks = get_top_k_chunks(question, chunks, k=3)
-            prompt = f"[CLAUSES]\n{chr(10).join(top_chunks)}\n\n[QUESTION]\n{question}"
+            clauses = retrieve_relevant_clauses(question)
+            prompt = f"[CLAUSES]\n{chr(10).join(clauses)}\n\n[QUESTION]\n{question}"
             answer = get_gpt_answer(prompt)
             log_to_neo4j(question, answer)
             final_answers.append(answer)
