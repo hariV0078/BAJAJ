@@ -6,3 +6,4 @@ pydantic
 gunicorn
 requests
 PyMuPDF>=1.22.0
+numpy
