@@ -1,7 +1,7 @@
 import os
 import requests
 import fitz  # PyMuPDF
-import openai
+from openai import OpenAI
 from typing import List
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -16,7 +16,7 @@ BEARER_TOKEN = os.getenv("BEARER_TOKEN", "e0e272cd2f3ac51a8dda3c63908707c12fc63d
 
 # --- Init ---
 app = FastAPI()
-openai.api_key = OPENAI_API_KEY
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 neo4j_driver = GraphDatabase.driver(AURA_URI, auth=(AURA_USER, AURA_PASSWORD))
 
 class EvaluationRequest(BaseModel):
@@ -81,9 +81,11 @@ async def handle_request(request: EvaluationRequest, authorization: str = Header
         raise HTTPException(status_code=403, detail="Invalid token")
 
     try:
-        # Optional: extract and store clauses only once (skip on repeated calls)
+        # Extract and store clauses (if not already stored)
         full_text = extract_pdf_text(request.documents)
-        if "Clause_0" not in [r["id"] for r in neo4j_driver.session().run("MATCH (c:Clause) RETURN c.id AS id")]:
+        with neo4j_driver.session() as session:
+            clause_ids = [r["id"] for r in session.run("MATCH (c:Clause) RETURN c.id AS id")]
+        if "Clause_0" not in clause_ids:
             clause_list = full_text.split("\n\n")
             store_clauses_in_neo4j(clause_list)
 
@@ -98,15 +100,15 @@ async def handle_request(request: EvaluationRequest, authorization: str = Header
 {question}
             """
 
-            completion = openai.ChatCompletion.create(
-                model="gpt-4o",  # Or use "gpt-3.5-turbo" for lighter version
+            completion = openai_client.chat.completions.create(
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
                 ]
             )
 
-            answer = completion["choices"][0]["message"]["content"].strip()
+            answer = completion.choices[0].message.content.strip()
             final_answers.append(answer)
             log_to_neo4j(question, answer)
 
