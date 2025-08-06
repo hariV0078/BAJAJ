@@ -2,119 +2,147 @@ import os
 import requests
 import fitz  # PyMuPDF
 import json
+import numpy as np
 from typing import List
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+from openai import OpenAI
 from neo4j import GraphDatabase
 from functools import lru_cache
+from sklearn.metrics.pairwise import cosine_similarity
+import aiohttp
+import asyncio
+from fastapi.middleware.cors import CORSMiddleware
 
-# --- Config ---
+# --- Environment ---
 AURA_URI = os.getenv("AURA_URI")
 AURA_USER = os.getenv("AURA_USER")
 AURA_PASSWORD = os.getenv("AURA_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 
+# Timeout settings (in seconds)
+PDF_DOWNLOAD_TIMEOUT = 30
+OPENAI_TIMEOUT = 30
+NEO4J_TIMEOUT = 10
+
 # --- Init ---
 app = FastAPI()
 
+# Add CORS middleware to handle potential CORS issues
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure HTTP client with timeouts
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=OPENAI_TIMEOUT
+)
+
 @lru_cache()
 def get_neo4j_driver():
-    return GraphDatabase.driver(AURA_URI, auth=(AURA_USER, AURA_PASSWORD))
+    return GraphDatabase.driver(
+        AURA_URI, 
+        auth=(AURA_USER, AURA_PASSWORD),
+        connection_timeout=NEO4J_TIMEOUT
+    )
 
+# --- Request Schema ---
 class EvaluationRequest(BaseModel):
     documents: str
     questions: List[str]
 
+# --- System Prompt ---
 SYSTEM_PROMPT = """
 You are an AI assistant for insurance policies. Answer each question in one complete sentence using only the context provided.
 
-Do not say “Based on the context” or “According to the document”. Do not return JSON or bullet points. Just the answer as a sentence.
+Do not say "Based on the context" or "According to the document". Do not return JSON or bullet points. Just the answer as a sentence.
 """
 
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-
-@app.get("/")
-def health():
-    return {"status": "ok"}
-
 # --- PDF Text Extraction ---
-def extract_pdf_text(url: str) -> str:
-    response = requests.get(url)
-    if response.status_code != 200:
-        raise Exception("Failed to download PDF.")
-    with open("temp_policy.pdf", "wb") as f:
-        f.write(response.content)
-    text = ""
-    with fitz.open("temp_policy.pdf") as doc:
-        for page in doc:
-            text += page.get_text()
-    return text
+async def extract_pdf_text(url: str) -> str:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=PDF_DOWNLOAD_TIMEOUT) as response:
+                if response.status != 200:
+                    raise Exception(f"Failed to download PDF. Status: {response.status}")
+                
+                content = await response.read()
+                with open("temp_policy.pdf", "wb") as f:
+                    f.write(content)
+                
+                text = ""
+                with fitz.open("temp_policy.pdf") as doc:
+                    for page in doc:
+                        text += page.get_text()
+                return text
+    except Exception as e:
+        raise Exception(f"PDF processing error: {str(e)}")
 
 # --- Chunking ---
-def chunk_text(text: str, chunk_size: int = 500) -> List[str]:
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks = []
-    current = ""
-    for para in paragraphs:
-        if len(current) + len(para) < chunk_size:
-            current += " " + para
-        else:
-            chunks.append(current.strip())
-            current = para
-    if current:
-        chunks.append(current.strip())
-    return chunks
+def chunk_text(text, chunk_size=500):
+    words = text.split()
+    return [' '.join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
-# --- Store Chunks in Neo4j ---
-def store_chunks_in_neo4j(chunks: List[str]):
-    with get_neo4j_driver().session() as session:
-        for i, chunk in enumerate(chunks):
-            session.run(
-                "MERGE (c:Clause {id: $id}) SET c.text = $text",
-                id=f"Clause_{i}", text=chunk
+# --- Embedding ---
+async def get_embedding(text: str) -> List[float]:
+    try:
+        response = await asyncio.wait_for(
+            client.embeddings.create(
+                model="text-embedding-ada-002",
+                input=text
+            ),
+            timeout=OPENAI_TIMEOUT
+        )
+        return response.data[0].embedding
+    except asyncio.TimeoutError:
+        raise Exception("OpenAI embedding request timed out")
+
+# --- Top-k Chunk Retrieval ---
+async def get_top_k_chunks(question: str, chunks: List[str], k=3) -> List[str]:
+    try:
+        q_emb = await get_embedding(question)
+        chunk_embs = [await get_embedding(chunk) for chunk in chunks]
+        sims = cosine_similarity([q_emb], chunk_embs)[0]
+        top_k_indices = np.argsort(sims)[-k:][::-1]
+        return [chunks[i] for i in top_k_indices]
+    except Exception as e:
+        raise Exception(f"Chunk retrieval error: {str(e)}")
+
+# --- Logging ---
+async def log_to_neo4j(question: str, answer: str):
+    try:
+        driver = get_neo4j_driver()
+        async with driver.session() as session:
+            await session.run(
+                "CREATE (:QueryLog {question: $q, answer: $a, timestamp: datetime()})",
+                q=question, a=answer
             )
+    except Exception as e:
+        print(f"Neo4j logging failed (non-critical): {str(e)}")
 
-# --- Query relevant clauses ---
-def retrieve_relevant_clauses(question: str, limit=3):
-    with get_neo4j_driver().session() as session:
-        results = session.run(
-            """
-            CALL db.index.fulltext.queryNodes('clauseIndex', $question) YIELD node, score
-            WHERE size(node.text) < 1000
-            RETURN substring(node.text, 0, 500) AS clause
-            ORDER BY score DESC
-            LIMIT $limit
-            """, question=question, limit=limit
+# --- GPT Completion ---
+async def get_gpt_answer(prompt: str) -> str:
+    try:
+        chat = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2
+            ),
+            timeout=OPENAI_TIMEOUT
         )
-        return [record["clause"] for record in results]
-
-# --- Log interaction ---
-def log_to_neo4j(question: str, answer: str):
-    with get_neo4j_driver().session() as session:
-        session.run(
-            "CREATE (:QueryLog {question: $q, answer: $a, timestamp: datetime()})",
-            q=question, a=answer
-        )
-
-# --- OpenAI Completion ---
-def get_gpt_answer(prompt: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    body = {
-        "model": "gpt-4o",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2
-    }
-    response = requests.post(OPENAI_API_URL, headers=headers, json=body)
-    if response.status_code != 200:
-        raise Exception(f"OpenAI error: {response.text}")
-    return response.json()["choices"][0]["message"]["content"].strip()
+        return chat.choices[0].message.content.strip()
+    except asyncio.TimeoutError:
+        raise Exception("OpenAI chat completion timed out")
 
 # --- Main Endpoint ---
 @app.post("/hackrx/run")
@@ -125,22 +153,19 @@ async def handle_request(request: EvaluationRequest, authorization: str = Header
         raise HTTPException(status_code=403, detail="Invalid token")
 
     try:
-        text = extract_pdf_text(request.documents)
-        chunks = chunk_text(text)
-
-        # Store only once
-        with get_neo4j_driver().session() as session:
-            existing = session.run("MATCH (c:Clause) RETURN c.id AS id")
-            if not any(r["id"] == "Clause_0" for r in existing):
-                store_chunks_in_neo4j(chunks)
-
+        full_text = await extract_pdf_text(request.documents)
+        chunks = chunk_text(full_text)
         final_answers = []
+
         for question in request.questions:
-            clauses = retrieve_relevant_clauses(question)
-            prompt = f"[CLAUSES]\n{chr(10).join(clauses)}\n\n[QUESTION]\n{question}"
-            answer = get_gpt_answer(prompt)
-            log_to_neo4j(question, answer)
-            final_answers.append(answer)
+            try:
+                top_chunks = await get_top_k_chunks(question, chunks, k=3)
+                prompt = f"[CLAUSES]\n{chr(10).join(top_chunks)}\n\n[QUESTION]\n{question}"
+                answer = await get_gpt_answer(prompt)
+                asyncio.create_task(log_to_neo4j(question, answer))  # Fire and forget
+                final_answers.append(answer)
+            except Exception as e:
+                final_answers.append(f"Error processing question: {str(e)}")
 
         return {
             "answers": final_answers,
@@ -148,8 +173,10 @@ async def handle_request(request: EvaluationRequest, authorization: str = Header
         }
 
     except Exception as e:
-        return {
-            "answers": [],
-            "error": str(e),
-            "success": False
-        }
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(e),
+                "success": False
+            }
+        )
