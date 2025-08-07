@@ -7,8 +7,7 @@ import os
 from datetime import datetime
 import logging
 from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
+import pinecone
 import PyPDF2
 import docx
 import re
@@ -37,17 +36,27 @@ class QueryResponse(BaseModel):
 
 # Configuration
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-FAISS_INDEX_PATH = "faiss_index.index"
 CHUNK_SIZE = 500  # characters
 OVERLAP = 50      # characters
 MAX_TOKENS = 4096  # For GPT-4
 TEMPERATURE = 0.3
+PINECONE_INDEX_NAME = "intelligent-query-system"
+EMBEDDING_DIMENSION = 384  # For all-MiniLM-L6-v2
 
 # Initialize components
 embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-faiss_index = None
-document_chunks = []
-metadata = []
+pinecone.init(api_key=os.getenv("PINECONE_API_KEY"), environment=os.getenv("PINECONE_ENV"))
+
+# Check if index exists, create if not
+if PINECONE_INDEX_NAME not in pinecone.list_indexes():
+    pinecone.create_index(
+        name=PINECONE_INDEX_NAME,
+        dimension=EMBEDDING_DIMENSION,
+        metric="cosine"
+    )
+
+# Connect to index
+index = pinecone.Index(PINECONE_INDEX_NAME)
 
 # Utility Functions
 def download_file(url: str) -> str:
@@ -97,43 +106,41 @@ def chunk_text(text: str) -> List[str]:
         start = end - OVERLAP
     return chunks
 
-def create_faiss_index(embeddings: np.ndarray):
-    """Create and save FAISS index"""
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-    faiss.write_index(index, FAISS_INDEX_PATH)
-    return index
-
-def load_or_create_index(chunks: List[str]):
-    """Load or create FAISS index"""
-    global faiss_index, document_chunks, metadata
+def upsert_to_pinecone(chunks: List[str], document_id: str):
+    """Upload document chunks to Pinecone with embeddings"""
+    vectors = []
+    for i, chunk in enumerate(chunks):
+        # Generate embedding for each chunk
+        embedding = embedding_model.encode(chunk).tolist()
+        
+        # Create unique ID for each chunk
+        chunk_id = f"{document_id}-{i}"
+        
+        vectors.append((chunk_id, embedding, {"text": chunk, "document_id": document_id}))
     
-    if os.path.exists(FAISS_INDEX_PATH):
-        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
-    else:
-        embeddings = embedding_model.encode(chunks)
-        faiss_index = create_faiss_index(embeddings)
-    
-    document_chunks = chunks
-    metadata = [{"source": "document", "chunk_id": i} for i in range(len(chunks))]
+    # Upsert in batches of 100 (Pinecone limit)
+    for i in range(0, len(vectors), 100):
+        batch = vectors[i:i+100]
+        index.upsert(vectors=batch)
 
 def semantic_search(query: str, k: int = 3) -> List[dict]:
-    """Perform semantic search using FAISS"""
-    query_embedding = embedding_model.encode([query])
-    distances, indices = faiss_index.search(query_embedding, k)
+    """Perform semantic search using Pinecone"""
+    query_embedding = embedding_model.encode(query).tolist()
     
-    results = []
-    for i, distance in zip(indices[0], distances[0]):
-        if i == -1:  # Invalid index
-            continue
-        results.append({
-            "chunk": document_chunks[i],
-            "metadata": metadata[i],
-            "score": float(1 / (1 + distance))  # Convert distance to similarity score
-        })
+    results = index.query(
+        vector=query_embedding,
+        top_k=k,
+        include_metadata=True
+    )
     
-    return sorted(results, key=lambda x: x['score'], reverse=True)
+    return [
+        {
+            "chunk": match["metadata"]["text"],
+            "score": match["score"],
+            "metadata": match["metadata"]
+        }
+        for match in results["matches"]
+    ]
 
 def generate_response_with_llm(query: str, context: str) -> str:
     """Generate response using LLM with context"""
@@ -158,7 +165,7 @@ def generate_response_with_llm(query: str, context: str) -> str:
     return response.choices[0].message.content.strip()
 
 def process_document(document_url: str):
-    """Process document and create search index"""
+    """Process document and upload to Pinecone"""
     try:
         local_path = download_file(document_url)
         
@@ -171,7 +178,10 @@ def process_document(document_url: str):
         
         text = preprocess_text(text)
         chunks = chunk_text(text)
-        load_or_create_index(chunks)
+        
+        # Use document URL as document ID
+        document_id = hashlib.md5(document_url.encode()).hexdigest()
+        upsert_to_pinecone(chunks, document_id)
         
         os.remove(local_path)
         return True
