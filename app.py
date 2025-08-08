@@ -12,7 +12,6 @@ import hashlib
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import pinecone
-from pinecone import Pinecone, ServerlessSpec
 import openai
 import fitz  # PyMuPDF
 from docx import Document
@@ -26,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 # Global variables for models and indices
 embedding_model = None
-pinecone_client = None
 pinecone_index = None
 document_chunks = []
 document_metadata = []
@@ -34,43 +32,42 @@ document_metadata = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize models and resources on startup"""
-    global embedding_model, pinecone_client, pinecone_index
+    global embedding_model, pinecone_index
     
     logger.info("Loading embedding model...")
     embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
     
     logger.info("Initializing Pinecone...")
     try:
-        # Initialize Pinecone client
+        # Initialize Pinecone
         pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        pinecone_env = os.getenv("PINECONE_ENVIRONMENT", "us-east1-gcp")
+        
         if not pinecone_api_key:
             logger.warning("Pinecone API key not found. Set PINECONE_API_KEY environment variable.")
         else:
-            pinecone_client = Pinecone(api_key=pinecone_api_key)
+            pinecone.init(
+                api_key=pinecone_api_key,
+                environment=pinecone_env
+            )
             
             # Create or get index
             index_name = os.getenv("PINECONE_INDEX_NAME", "document-query-system")
             
             # Check if index exists, if not create it
-            try:
-                pinecone_index = pinecone_client.Index(index_name)
-                logger.info(f"Connected to existing Pinecone index: {index_name}")
-            except:
+            if index_name not in pinecone.list_indexes():
                 logger.info(f"Creating new Pinecone index: {index_name}")
-                pinecone_client.create_index(
+                pinecone.create_index(
                     name=index_name,
                     dimension=384,  # all-MiniLM-L6-v2 dimension
-                    metric='cosine',
-                    spec=ServerlessSpec(
-                        cloud='aws',
-                        region='us-east-1'
-                    )
+                    metric='cosine'
                 )
-                pinecone_index = pinecone_client.Index(index_name)
+            
+            pinecone_index = pinecone.Index(index_name)
+            logger.info(f"Connected to Pinecone index: {index_name}")
                 
     except Exception as e:
         logger.error(f"Failed to initialize Pinecone: {e}")
-        pinecone_client = None
         pinecone_index = None
     
     logger.info("Application startup complete")
@@ -95,6 +92,7 @@ if not openai.api_key:
 
 # Pinecone Configuration
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east1-gcp")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "document-query-system")
 
 if not PINECONE_API_KEY:
@@ -252,7 +250,7 @@ class EmbeddingSearch:
             raise HTTPException(status_code=500, detail="Pinecone index not initialized")
         
         # Prepare vectors for upsert
-        vectors = []
+        vectors_to_upsert = []
         for i, (embedding, chunk) in enumerate(zip(embeddings, chunks)):
             vector_id = f"{doc_id}_{i}"
             metadata = {
@@ -263,16 +261,12 @@ class EmbeddingSearch:
                 'doc_id': doc_id,
                 'chunk_index': i
             }
-            vectors.append({
-                'id': vector_id,
-                'values': embedding,
-                'metadata': metadata
-            })
+            vectors_to_upsert.append((vector_id, embedding, metadata))
         
         # Upsert in batches to handle large documents
         batch_size = 100
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
+        for i in range(0, len(vectors_to_upsert), batch_size):
+            batch = vectors_to_upsert[i:i + batch_size]
             pinecone_index.upsert(vectors=batch)
     
     @staticmethod
@@ -381,7 +375,6 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "services": {
             "embedding_model": embedding_model is not None,
-            "pinecone_client": pinecone_client is not None,
             "pinecone_index": pinecone_index is not None,
             "openai": bool(openai.api_key)
         }
