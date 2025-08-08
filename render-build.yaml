@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: intelligent-query-system
+    runtime: python
+    pythonVersion: "3.11"  # Explicitly specify Python 3.11
+    buildCommand: |
+      pip install -r requirements.txt
+      python -m nltk.downloader punkt
+    startCommand: gunicorn -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 main:app
+    envVars:
+      - key: PINECONE_API_KEY
+        value: your-pinecone-api-key
+      - key: PINECONE_ENV
+        value: your-pinecone-environment
+      - key: OPENAI_API_KEY
+        value: your-openai-api-key
