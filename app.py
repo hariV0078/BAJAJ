@@ -13,7 +13,14 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import pinecone
 import openai
-import fitz  # PyMuPDF
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
 from docx import Document
 import tempfile
 import uvicorn
@@ -135,21 +142,54 @@ class DocumentProcessor:
 
     @staticmethod
     def extract_text_from_pdf(content: bytes) -> str:
-        """Extract text from PDF content"""
+        """Extract text from PDF content using available libraries"""
         try:
             with tempfile.NamedTemporaryFile(delete=False) as temp_file:
                 temp_file.write(content)
                 temp_file.flush()
                 
-                doc = fitz.open(temp_file.name)
                 text = ""
-                for page in doc:
-                    text += page.get_text()
-                doc.close()
+                
+                # Method 1: Try pdfplumber first (better for complex layouts)
+                if pdfplumber:
+                    try:
+                        with pdfplumber.open(temp_file.name) as pdf:
+                            for page in pdf.pages:
+                                page_text = page.extract_text()
+                                if page_text:
+                                    text += page_text + "\n"
+                        
+                        if text.strip():
+                            os.unlink(temp_file.name)
+                            return text
+                    except Exception as e:
+                        logger.warning(f"pdfplumber failed: {e}")
+                
+                # Method 2: Fallback to PyPDF2
+                if PyPDF2:
+                    try:
+                        with open(temp_file.name, 'rb') as file:
+                            pdf_reader = PyPDF2.PdfReader(file)
+                            text = ""
+                            for page in pdf_reader.pages:
+                                text += page.extract_text() + "\n"
+                        
+                        os.unlink(temp_file.name)
+                        return text
+                    except Exception as e:
+                        logger.warning(f"PyPDF2 failed: {e}")
+                
+                # If no PDF library is available or all failed
                 os.unlink(temp_file.name)
-                return text
+                raise HTTPException(
+                    status_code=500, 
+                    detail="No PDF processing library available or all PDF processing methods failed"
+                )
+                    
         except Exception as e:
             logger.error(f"Error extracting PDF text: {e}")
+            if "No PDF processing library" in str(e):
+                raise e
             raise HTTPException(status_code=500, detail="Failed to extract text from PDF")
 
     @staticmethod
@@ -170,21 +210,50 @@ class DocumentProcessor:
 
     @classmethod
     async def process_document(cls, url: str) -> str:
-        """Process document and extract text"""
+        """Process document and extract text with fallback mechanisms"""
         content = await cls.download_document(url)
         
         # Determine file type from URL or content
         url_lower = str(url).lower()
+        
         if url_lower.endswith('.pdf') or b'%PDF' in content[:10]:
-            return cls.extract_text_from_pdf(content)
+            try:
+                return cls.extract_text_from_pdf(content)
+            except Exception as e:
+                logger.error(f"PDF processing failed: {e}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail="Failed to process PDF. Please ensure the PDF is not corrupted or password-protected."
+                )
+        
         elif url_lower.endswith('.docx') or b'PK' in content[:2]:
-            return cls.extract_text_from_docx(content)
+            try:
+                return cls.extract_text_from_docx(content)
+            except Exception as e:
+                logger.error(f"DOCX processing failed: {e}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail="Failed to process DOCX file. Please ensure the file is not corrupted."
+                )
+        
         else:
             # Try to decode as text
             try:
+                # Try UTF-8 first
                 return content.decode('utf-8')
             except UnicodeDecodeError:
-                raise HTTPException(status_code=400, detail="Unsupported file format")
+                try:
+                    # Try latin-1 as fallback
+                    return content.decode('latin-1')
+                except UnicodeDecodeError:
+                    try:
+                        # Try cp1252 as another fallback
+                        return content.decode('cp1252')
+                    except UnicodeDecodeError:
+                        raise HTTPException(
+                            status_code=400, 
+                            detail="Unsupported file format or encoding. Supported formats: PDF, DOCX, plain text"
+                        )
 
 class TextChunker:
     """Handles text chunking for embeddings"""
@@ -393,6 +462,46 @@ async def health_check():
             health_status["pinecone_error"] = str(e)
     
     return health_status
+
+@app.post("/test/document")
+async def test_document_processing(
+    request: DocumentQuery,
+    credentials: HTTPAuthorizationCredentials = Depends(verify_token)
+):
+    """Test endpoint for document processing without full query pipeline"""
+    try:
+        logger.info(f"Testing document processing: {request.documents}")
+        
+        # Step 1: Download and extract text
+        document_text = await DocumentProcessor.process_document(str(request.documents))
+        
+        # Basic stats
+        char_count = len(document_text)
+        word_count = len(document_text.split())
+        line_count = len(document_text.split('\n'))
+        
+        # Step 2: Test chunking
+        chunks = TextChunker.chunk_text(document_text)
+        
+        return {
+            "status": "success",
+            "document_stats": {
+                "characters": char_count,
+                "words": word_count,
+                "lines": line_count,
+                "chunks_created": len(chunks)
+            },
+            "sample_text": document_text[:500] + "..." if len(document_text) > 500 else document_text,
+            "first_chunk": chunks[0]['text'][:200] + "..." if chunks and len(chunks[0]['text']) > 200 else chunks[0]['text'] if chunks else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in document processing test: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
 
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_query_system(
