@@ -1,4 +1,4 @@
-# Core dependencies (updated for Python 3.13)
+# Core dependencies
 setuptools>=68.0.0
 wheel>=0.40.0
 pip>=23.0.0
@@ -11,17 +11,17 @@ httpx==0.25.0
 pydantic==2.4.2
 
 # NLP & Vector DB
-sentence-transformers>=2.3.0  # Fixes ImpImporter issue
-pinecone-client==3.0.1       # Updated for Python 3.13
-openai>=1.12.0              # Modern OpenAI SDK
+sentence-transformers>=2.3.0
+pinecone-client==2.2.4  # Downgraded for Python 3.13 compatibility
+openai>=1.12.0
 
 # PDF & Document Processing
-PyPDF2>=3.0.1               # Works with Python 3.13
+PyPDF2>=3.0.1
 pdfplumber==0.10.3
 python-docx==1.1.0
 
 # Math & Security
-numpy>=2.0.0                # Critical for Python 3.13
+numpy>=2.0.0
 python-multipart==0.0.6
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
